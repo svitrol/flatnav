@@ -114,10 +114,18 @@ struct SquaredL2Impl<uint8_t> {
   static float computeDistance(const uint8_t* x, const uint8_t* y, const size_t& dimension) {
 #if defined(USE_AVX512)
     if (platformSupportsAvx512()) {
-      if (dimension % 64 == 0) {
-        return util::compute_l2_avx512_uint8(x, y, dimension);
-      }
+      return util::compute_l2_avx512_uint8(x, y, dimension);
     }
+#endif
+
+#if defined(USE_AVX)
+    if (platformSupportsAvx()) {
+      return util::compute_l2_avx2_uint8(x, y, dimension);
+    }
+#endif
+
+#if defined(USE_SSE4_1)
+    return util::compute_l2_sse_uint8(x, y, dimension);
 #endif
 
     return default_squared_l2<uint8_t>(x, y, dimension);

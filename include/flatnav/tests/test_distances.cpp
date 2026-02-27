@@ -313,9 +313,184 @@ TEST(Int8DistanceTest, TestAvx512IPInt8) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// uint8 SIMD distance tests
+//
+// Same structure as int8 tests, but with uint8 data in the full [0, 255]
+// range. The key difference in the SIMD kernels is zero-extension (cvtepu8)
+// instead of sign-extension (cvtepi8).
+// ---------------------------------------------------------------------------
+
+static constexpr size_t kUint8NumVectors = 1000;
+static constexpr float kUint8Epsilon = 1.0f;
+
+// Helper: generate random uint8 test data with a fixed seed for reproducibility.
+static void generateUint8TestData(uint8_t* x, uint8_t* y, size_t total_size, unsigned seed = 42) {
+  std::default_random_engine generator(seed);
+  std::uniform_int_distribution<int> distribution(0, 255);
+  for (size_t i = 0; i < total_size; i++) {
+    x[i] = static_cast<uint8_t>(distribution(generator));
+    y[i] = static_cast<uint8_t>(distribution(generator));
+  }
+}
+
+// Helper: run a SIMD kernel against the scalar baseline for multiple uint8
+// vector pairs at two different dimensions (aligned and residual).
+template <typename KernelFn, typename BaselineFn>
+static void runUint8KernelTest(KernelFn kernel, BaselineFn baseline,
+                                size_t aligned_dim, size_t residual_dim) {
+  // --- Test with aligned dimension ---
+  {
+    size_t total_size = aligned_dim * kUint8NumVectors;
+    std::vector<uint8_t> x_data(total_size), y_data(total_size);
+    generateUint8TestData(x_data.data(), y_data.data(), total_size, 42);
+
+    for (size_t i = 0; i < kUint8NumVectors; i++) {
+      const uint8_t* xp = x_data.data() + i * aligned_dim;
+      const uint8_t* yp = y_data.data() + i * aligned_dim;
+      float result = kernel(xp, yp, aligned_dim);
+      float expected = baseline(xp, yp, aligned_dim);
+      ASSERT_NEAR(result, expected, kUint8Epsilon)
+          << "Mismatch at vector " << i << " with aligned dimension " << aligned_dim;
+    }
+  }
+
+  // --- Test with residual dimension (exercises scalar tail loop) ---
+  {
+    size_t total_size = residual_dim * kUint8NumVectors;
+    std::vector<uint8_t> x_data(total_size), y_data(total_size);
+    generateUint8TestData(x_data.data(), y_data.data(), total_size, 123);
+
+    for (size_t i = 0; i < kUint8NumVectors; i++) {
+      const uint8_t* xp = x_data.data() + i * residual_dim;
+      const uint8_t* yp = y_data.data() + i * residual_dim;
+      float result = kernel(xp, yp, residual_dim);
+      float expected = baseline(xp, yp, residual_dim);
+      ASSERT_NEAR(result, expected, kUint8Epsilon)
+          << "Mismatch at vector " << i << " with residual dimension " << residual_dim;
+    }
+  }
+}
+
+// --- L2 uint8 kernel tests ---
+
+TEST(Uint8DistanceTest, TestSseL2Uint8) {
+#if defined(USE_SSE4_1)
+  runUint8KernelTest(
+      flatnav::util::compute_l2_sse_uint8,
+      flatnav::distances::default_squared_l2<uint8_t>,
+      128,  // aligned: multiple of 16
+      100   // residual: not a multiple of 16
+  );
+#endif
+}
+
+TEST(Uint8DistanceTest, TestAvx2L2Uint8) {
+#if defined(USE_AVX)
+  runUint8KernelTest(
+      flatnav::util::compute_l2_avx2_uint8,
+      flatnav::distances::default_squared_l2<uint8_t>,
+      128,  // aligned: multiple of 32
+      100   // residual: not a multiple of 32
+  );
+#endif
+}
+
+TEST(Uint8DistanceTest, TestAvx512L2Uint8) {
+#if defined(USE_AVX512)
+  runUint8KernelTest(
+      flatnav::util::compute_l2_avx512_uint8,
+      flatnav::distances::default_squared_l2<uint8_t>,
+      128,  // aligned: multiple of 32 (AVX512 kernel processes 32 bytes/iter)
+      100   // residual
+  );
+#endif
+}
+
+// --- IP uint8 kernel tests ---
+
+TEST(Uint8DistanceTest, TestSseIPUint8) {
+#if defined(USE_SSE4_1)
+  runUint8KernelTest(
+      flatnav::util::compute_ip_sse_uint8,
+      flatnav::distances::default_inner_product<uint8_t>,
+      128,  // aligned: multiple of 16
+      100   // residual
+  );
+#endif
+}
+
+TEST(Uint8DistanceTest, TestAvx2IPUint8) {
+#if defined(USE_AVX)
+  runUint8KernelTest(
+      flatnav::util::compute_ip_avx2_uint8,
+      flatnav::distances::default_inner_product<uint8_t>,
+      128,  // aligned: multiple of 32
+      100   // residual
+  );
+#endif
+}
+
+TEST(Uint8DistanceTest, TestAvx512IPUint8) {
+#if defined(USE_AVX512)
+  runUint8KernelTest(
+      flatnav::util::compute_ip_avx512_uint8,
+      flatnav::distances::default_inner_product<uint8_t>,
+      128,  // aligned: multiple of 32
+      100   // residual
+  );
+#endif
+}
+
 // --- Dispatcher end-to-end tests ---
 // These test whichever SIMD path the build machine actually supports,
 // ensuring the dispatch logic routes correctly.
+
+TEST(Uint8DistanceTest, TestL2DispatcherUint8) {
+  constexpr size_t dim = 128;
+  constexpr size_t dim_residual = 100;
+  std::vector<uint8_t> x_data(dim), y_data(dim);
+  generateUint8TestData(x_data.data(), y_data.data(), dim, 77);
+
+  float result = flatnav::distances::SquaredL2Impl<uint8_t>::computeDistance(
+      x_data.data(), y_data.data(), dim);
+  float expected = flatnav::distances::default_squared_l2<uint8_t>(
+      x_data.data(), y_data.data(), dim);
+  ASSERT_NEAR(result, expected, kUint8Epsilon);
+
+  // Also test with a residual dimension
+  std::vector<uint8_t> x_res(dim_residual), y_res(dim_residual);
+  generateUint8TestData(x_res.data(), y_res.data(), dim_residual, 88);
+
+  result = flatnav::distances::SquaredL2Impl<uint8_t>::computeDistance(
+      x_res.data(), y_res.data(), dim_residual);
+  expected = flatnav::distances::default_squared_l2<uint8_t>(
+      x_res.data(), y_res.data(), dim_residual);
+  ASSERT_NEAR(result, expected, kUint8Epsilon);
+}
+
+TEST(Uint8DistanceTest, TestIPDispatcherUint8) {
+  constexpr size_t dim = 128;
+  constexpr size_t dim_residual = 100;
+  std::vector<uint8_t> x_data(dim), y_data(dim);
+  generateUint8TestData(x_data.data(), y_data.data(), dim, 77);
+
+  float result = flatnav::distances::InnerProductImpl<uint8_t>::computeDistance(
+      x_data.data(), y_data.data(), dim);
+  float expected = flatnav::distances::default_inner_product<uint8_t>(
+      x_data.data(), y_data.data(), dim);
+  ASSERT_NEAR(result, expected, kUint8Epsilon);
+
+  // Also test with a residual dimension
+  std::vector<uint8_t> x_res(dim_residual), y_res(dim_residual);
+  generateUint8TestData(x_res.data(), y_res.data(), dim_residual, 88);
+
+  result = flatnav::distances::InnerProductImpl<uint8_t>::computeDistance(
+      x_res.data(), y_res.data(), dim_residual);
+  expected = flatnav::distances::default_inner_product<uint8_t>(
+      x_res.data(), y_res.data(), dim_residual);
+  ASSERT_NEAR(result, expected, kUint8Epsilon);
+}
 
 TEST(Int8DistanceTest, TestL2DispatcherInt8) {
   constexpr size_t dim = 128;

@@ -26,53 +26,42 @@ static float compute_l2_avx512(const void* x, const void* y, const size_t& dimen
   return sum.reduce_add();
 }
 
-/**
- * @todo Make this support dimensions that are not multiples of 64
- */
+// Computes the squared L2 distance between two uint8 vectors using AVX512BW.
+//
+// Strategy: load 32 uint8 values (256 bits) per iteration and zero-extend
+// to 32 int16 values in a 512-bit register via _mm512_cvtepu8_epi16
+// (AVX512BW). After zero-extending both vectors, we subtract in int16
+// and use _mm512_madd_epi16(diff, diff) to square-and-accumulate into int32.
+//
+// Handles arbitrary dimensions via a scalar tail loop.
 static float compute_l2_avx512_uint8(const void* x, const void* y, const size_t& dimension) {
   const uint8_t* pointer_x = static_cast<const uint8_t*>(x);
   const uint8_t* pointer_y = static_cast<const uint8_t*>(y);
 
-  // Initialize sum to zero
   __m512i sum = _mm512_setzero_si512();
+  size_t aligned_dimension = dimension & ~0x1F;  // round down to multiple of 32
+  size_t i = 0;
 
-  // Loop over the input arrays
-  for (size_t i = 0; i < dimension; i += 64) {
-    // Load 64 bytes from each array
-    __m512i v1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(pointer_x + i));
-    __m512i v2 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(pointer_y + i));
+  for (; i < aligned_dimension; i += 32) {
+    // Load 32 uint8 values and zero-extend to 32 int16 values
+    __m512i a_i16 = _mm512_cvtepu8_epi16(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_x + i)));
+    __m512i b_i16 = _mm512_cvtepu8_epi16(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_y + i)));
 
-    // Unpack to 16-bit integers to avoid overflow
-    __m512i v1_lo = _mm512_unpacklo_epi8(v1, _mm512_setzero_si512());
-    __m512i v1_hi = _mm512_unpackhi_epi8(v1, _mm512_setzero_si512());
-    __m512i v2_lo = _mm512_unpacklo_epi8(v2, _mm512_setzero_si512());
-    __m512i v2_hi = _mm512_unpackhi_epi8(v2, _mm512_setzero_si512());
-
-    // Compute differences
-    __m512i diff_lo = _mm512_sub_epi16(v1_lo, v2_lo);
-    __m512i diff_hi = _mm512_sub_epi16(v1_hi, v2_hi);
-
-    // Square the differences
-    __m512i diff_squared_lo = _mm512_madd_epi16(diff_lo, diff_lo);
-    __m512i diff_squared_hi = _mm512_madd_epi16(diff_hi, diff_hi);
-
-    // Accumulate the results
-    sum = _mm512_add_epi32(sum, diff_squared_lo);
-    sum = _mm512_add_epi32(sum, diff_squared_hi);
+    __m512i diff = _mm512_sub_epi16(a_i16, b_i16);
+    sum = _mm512_add_epi32(sum, _mm512_madd_epi16(diff, diff));
   }
 
-  // Sum all elements in the sum vector
-  __m256i sum256 = _mm512_extracti64x4_epi64(sum, 0);
-  sum256 = _mm256_add_epi32(sum256, _mm512_extracti64x4_epi64(sum, 1));
-  sum256 = _mm256_hadd_epi32(sum256, sum256);
-  sum256 = _mm256_hadd_epi32(sum256, sum256);
+  // Scalar tail for remaining elements
+  int32_t partial_sum = 0;
+  for (; i < dimension; i++) {
+    int diff = static_cast<int>(pointer_x[i]) - static_cast<int>(pointer_y[i]);
+    partial_sum += diff * diff;
+  }
 
-  int32_t buffer[8];
-  _mm256_storeu_si256(reinterpret_cast<__m256i*>(buffer), sum256);
-
-  int32_t total_sum = buffer[0] + buffer[4];
-
-  return static_cast<float>(total_sum);
+  int32_t total = _mm512_reduce_add_epi32(sum);
+  return static_cast<float>(total + partial_sum);
 }
 
 // Computes the squared L2 distance between two int8 vectors using AVX512BW.
@@ -226,6 +215,61 @@ static float compute_l2_avx2_int8(const void* x, const void* y, const size_t& di
   return static_cast<float>(_mm_cvtsi128_si32(sum128) + partial_sum);
 }
 
+// Computes the squared L2 distance between two uint8 vectors using AVX2.
+//
+// Strategy: load 32 uint8 values per iteration, split each 256-bit register
+// into two 128-bit halves, and zero-extend each half from 16 x uint8 to
+// 16 x int16 in a 256-bit register using _mm256_cvtepu8_epi16 (AVX2).
+// After zero-extending both vectors, we subtract in int16 and use
+// _mm256_madd_epi16(diff, diff) to square-and-accumulate into int32.
+//
+// Two separate int32 accumulators (low/high) exploit instruction-level
+// parallelism. Handles arbitrary dimensions via a scalar tail loop.
+static float compute_l2_avx2_uint8(const void* x, const void* y, const size_t& dimension) {
+  const uint8_t* pointer_x = static_cast<const uint8_t*>(x);
+  const uint8_t* pointer_y = static_cast<const uint8_t*>(y);
+
+  __m256i sum_lo = _mm256_setzero_si256();
+  __m256i sum_hi = _mm256_setzero_si256();
+  size_t aligned_dimension = dimension & ~0x1F;  // round down to multiple of 32
+  size_t i = 0;
+
+  for (; i < aligned_dimension; i += 32) {
+    __m256i a_u8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_x + i));
+    __m256i b_u8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_y + i));
+
+    // Zero-extend low 16 bytes to 16 x int16
+    __m256i a_i16_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(a_u8));
+    __m256i b_i16_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(b_u8));
+
+    // Zero-extend high 16 bytes to 16 x int16
+    __m256i a_i16_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(a_u8, 1));
+    __m256i b_i16_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(b_u8, 1));
+
+    // Subtract in int16, then square-and-accumulate into int32
+    __m256i diff_lo = _mm256_sub_epi16(a_i16_lo, b_i16_lo);
+    __m256i diff_hi = _mm256_sub_epi16(a_i16_hi, b_i16_hi);
+
+    sum_lo = _mm256_add_epi32(sum_lo, _mm256_madd_epi16(diff_lo, diff_lo));
+    sum_hi = _mm256_add_epi32(sum_hi, _mm256_madd_epi16(diff_hi, diff_hi));
+  }
+
+  // Scalar tail for remaining elements
+  int32_t partial_sum = 0;
+  for (; i < dimension; i++) {
+    int diff = static_cast<int>(pointer_x[i]) - static_cast<int>(pointer_y[i]);
+    partial_sum += diff * diff;
+  }
+
+  // Merge the two accumulators and horizontally reduce
+  __m256i combined = _mm256_add_epi32(sum_lo, sum_hi);
+  __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(combined),
+                                  _mm256_extracti128_si256(combined, 1));
+  sum128 = _mm_hadd_epi32(sum128, sum128);
+  sum128 = _mm_hadd_epi32(sum128, sum128);
+  return static_cast<float>(_mm_cvtsi128_si32(sum128) + partial_sum);
+}
+
 #endif  // USE_AVX
 
 #if defined(USE_SSE)
@@ -321,6 +365,56 @@ static float compute_l2_sse_int8(const void* x, const void* y, const size_t& dim
   int32_t partial_sum = 0;
   for (; i < dimension; i++) {
     int diff = pointer_x[i] - pointer_y[i];
+    partial_sum += diff * diff;
+  }
+
+  // Horizontal reduction: sum the 4 int32 lanes
+  int32_t buffer[4];
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), sum);
+  return static_cast<float>(buffer[0] + buffer[1] + buffer[2] + buffer[3] + partial_sum);
+}
+
+// Computes the squared L2 distance between two uint8 vectors using SSE4.1.
+//
+// Strategy: load 16 uint8 values per iteration, zero-extend each 8-byte half
+// from uint8 to int16 via _mm_cvtepu8_epi16 (SSE4.1). After zero-extending
+// both vectors, we subtract in int16 and use _mm_madd_epi16(diff, diff) to
+// square-and-accumulate into int32.
+//
+// _mm_cvtepu8_epi16 only zero-extends the LOW 8 bytes of a 128-bit register.
+// We process the high 8 bytes by shifting them down with _mm_srli_si128(v, 8)
+// before zero-extending.
+//
+// Handles arbitrary dimensions via a scalar tail loop.
+static float compute_l2_sse_uint8(const void* x, const void* y, const size_t& dimension) {
+  const uint8_t* pointer_x = static_cast<const uint8_t*>(x);
+  const uint8_t* pointer_y = static_cast<const uint8_t*>(y);
+
+  __m128i sum = _mm_setzero_si128();
+  size_t aligned_dimension = dimension & ~0xF;  // round down to multiple of 16
+  size_t i = 0;
+
+  for (; i < aligned_dimension; i += 16) {
+    __m128i vx = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pointer_x + i));
+    __m128i vy = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pointer_y + i));
+
+    // Low 8 bytes: zero-extend uint8 → int16, subtract, then square-and-accumulate
+    __m128i x_lo = _mm_cvtepu8_epi16(vx);
+    __m128i y_lo = _mm_cvtepu8_epi16(vy);
+    __m128i diff_lo = _mm_sub_epi16(x_lo, y_lo);
+    sum = _mm_add_epi32(sum, _mm_madd_epi16(diff_lo, diff_lo));
+
+    // High 8 bytes: shift down, zero-extend, subtract, then square-and-accumulate
+    __m128i x_hi = _mm_cvtepu8_epi16(_mm_srli_si128(vx, 8));
+    __m128i y_hi = _mm_cvtepu8_epi16(_mm_srli_si128(vy, 8));
+    __m128i diff_hi = _mm_sub_epi16(x_hi, y_hi);
+    sum = _mm_add_epi32(sum, _mm_madd_epi16(diff_hi, diff_hi));
+  }
+
+  // Scalar tail for remaining elements not divisible by 16
+  int32_t partial_sum = 0;
+  for (; i < dimension; i++) {
+    int diff = static_cast<int>(pointer_x[i]) - static_cast<int>(pointer_y[i]);
     partial_sum += diff * diff;
   }
 

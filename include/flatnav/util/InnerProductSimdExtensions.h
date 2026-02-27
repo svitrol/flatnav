@@ -76,6 +76,44 @@ static float compute_ip_avx512_int8(const void* x, const void* y, const size_t& 
   return 1.0f - dot;
 }
 
+// Computes the inner product distance (1 - dot) between two uint8 vectors
+// using AVX512BW.
+//
+// Strategy: load 32 uint8 values (256 bits) per iteration and zero-extend
+// to 32 int16 values in a 512-bit register via _mm512_cvtepu8_epi16
+// (AVX512BW). The dot product is accumulated using _mm512_madd_epi16(a, b).
+//
+// Returns 1.0f - dot_product to match the inner product distance convention.
+static float compute_ip_avx512_uint8(const void* x, const void* y, const size_t& dimension) {
+  const uint8_t* pointer_x = static_cast<const uint8_t*>(x);
+  const uint8_t* pointer_y = static_cast<const uint8_t*>(y);
+
+  __m512i sum = _mm512_setzero_si512();
+  size_t aligned_dimension = dimension & ~0x1F;  // round down to multiple of 32
+  size_t i = 0;
+
+  for (; i < aligned_dimension; i += 32) {
+    // Load 32 uint8 values and zero-extend to 32 int16 values
+    __m512i a_i16 = _mm512_cvtepu8_epi16(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_x + i)));
+    __m512i b_i16 = _mm512_cvtepu8_epi16(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_y + i)));
+
+    // Multiply-and-add: (a[0]*b[0] + a[1]*b[1], a[2]*b[2] + a[3]*b[3], ...)
+    sum = _mm512_add_epi32(sum, _mm512_madd_epi16(a_i16, b_i16));
+  }
+
+  // Scalar tail for remaining elements
+  int32_t partial_sum = 0;
+  for (; i < dimension; i++) {
+    partial_sum += static_cast<int32_t>(pointer_x[i]) * static_cast<int32_t>(pointer_y[i]);
+  }
+
+  int32_t total = _mm512_reduce_add_epi32(sum);
+  float dot = static_cast<float>(total + partial_sum);
+  return 1.0f - dot;
+}
+
 #endif  // USE_AVX512
 
 #if defined(USE_AVX)
@@ -183,6 +221,60 @@ static float compute_ip_avx2_int8(const void* x, const void* y, const size_t& di
     // Sign-extend high 16 bytes to 16 x int16
     __m256i a_i16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a_i8, 1));
     __m256i b_i16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b_i8, 1));
+
+    // Multiply-and-add into int32 accumulators
+    sum_lo = _mm256_add_epi32(sum_lo, _mm256_madd_epi16(a_i16_lo, b_i16_lo));
+    sum_hi = _mm256_add_epi32(sum_hi, _mm256_madd_epi16(a_i16_hi, b_i16_hi));
+  }
+
+  // Scalar tail for remaining elements
+  int32_t partial_sum = 0;
+  for (; i < dimension; i++) {
+    partial_sum += static_cast<int32_t>(pointer_x[i]) * static_cast<int32_t>(pointer_y[i]);
+  }
+
+  // Merge accumulators and horizontally reduce
+  __m256i combined = _mm256_add_epi32(sum_lo, sum_hi);
+  __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(combined),
+                                  _mm256_extracti128_si256(combined, 1));
+  sum128 = _mm_hadd_epi32(sum128, sum128);
+  sum128 = _mm_hadd_epi32(sum128, sum128);
+  float dot = static_cast<float>(_mm_cvtsi128_si32(sum128) + partial_sum);
+  return 1.0f - dot;
+}
+
+// Computes the inner product distance (1 - dot) between two uint8 vectors
+// using AVX2.
+//
+// Strategy: load 32 uint8 values per iteration, split each 256-bit register
+// into two 128-bit halves, and zero-extend each half from 16 x uint8 to
+// 16 x int16 in a 256-bit register using _mm256_cvtepu8_epi16 (AVX2).
+// The dot product is accumulated via _mm256_madd_epi16(a_half, b_half).
+//
+// Two separate int32 accumulators (low/high) exploit instruction-level
+// parallelism. Handles arbitrary dimensions via a scalar tail loop.
+//
+// Returns 1.0f - dot_product to match the inner product distance convention.
+static float compute_ip_avx2_uint8(const void* x, const void* y, const size_t& dimension) {
+  const uint8_t* pointer_x = static_cast<const uint8_t*>(x);
+  const uint8_t* pointer_y = static_cast<const uint8_t*>(y);
+
+  __m256i sum_lo = _mm256_setzero_si256();
+  __m256i sum_hi = _mm256_setzero_si256();
+  size_t aligned_dimension = dimension & ~0x1F;  // round down to multiple of 32
+  size_t i = 0;
+
+  for (; i < aligned_dimension; i += 32) {
+    __m256i a_u8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_x + i));
+    __m256i b_u8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(pointer_y + i));
+
+    // Zero-extend low 16 bytes to 16 x int16
+    __m256i a_i16_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(a_u8));
+    __m256i b_i16_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(b_u8));
+
+    // Zero-extend high 16 bytes to 16 x int16
+    __m256i a_i16_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(a_u8, 1));
+    __m256i b_i16_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(b_u8, 1));
 
     // Multiply-and-add into int32 accumulators
     sum_lo = _mm256_add_epi32(sum_lo, _mm256_madd_epi16(a_i16_lo, b_i16_lo));
@@ -332,6 +424,54 @@ static float compute_ip_sse_int8(const void* x, const void* y, const size_t& dim
     // High 8 bytes: shift down, sign-extend, then multiply-and-add
     __m128i x_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vx, 8));
     __m128i y_hi = _mm_cvtepi8_epi16(_mm_srli_si128(vy, 8));
+    sum = _mm_add_epi32(sum, _mm_madd_epi16(x_hi, y_hi));
+  }
+
+  // Scalar tail for remaining elements
+  int32_t partial_sum = 0;
+  for (; i < dimension; i++) {
+    partial_sum += static_cast<int32_t>(pointer_x[i]) * static_cast<int32_t>(pointer_y[i]);
+  }
+
+  // Horizontal reduction: sum the 4 int32 lanes
+  int32_t buffer[4];
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), sum);
+  float dot = static_cast<float>(buffer[0] + buffer[1] + buffer[2] + buffer[3] + partial_sum);
+  return 1.0f - dot;
+}
+
+// Computes the inner product distance (1 - dot) between two uint8 vectors
+// using SSE4.1.
+//
+// Strategy: load 16 uint8 values per iteration, zero-extend each 8-byte half
+// from uint8 to int16 via _mm_cvtepu8_epi16 (SSE4.1). The dot product is
+// accumulated via _mm_madd_epi16(a_half, b_half).
+//
+// _mm_cvtepu8_epi16 only zero-extends the LOW 8 bytes of a 128-bit register.
+// We process the high 8 bytes by shifting them down with _mm_srli_si128(v, 8)
+// before zero-extending.
+//
+// Returns 1.0f - dot_product to match the inner product distance convention.
+static float compute_ip_sse_uint8(const void* x, const void* y, const size_t& dimension) {
+  const uint8_t* pointer_x = static_cast<const uint8_t*>(x);
+  const uint8_t* pointer_y = static_cast<const uint8_t*>(y);
+
+  __m128i sum = _mm_setzero_si128();
+  size_t aligned_dimension = dimension & ~0xF;  // round down to multiple of 16
+  size_t i = 0;
+
+  for (; i < aligned_dimension; i += 16) {
+    __m128i vx = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pointer_x + i));
+    __m128i vy = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pointer_y + i));
+
+    // Low 8 bytes: zero-extend uint8 → int16, then multiply-and-add
+    __m128i x_lo = _mm_cvtepu8_epi16(vx);
+    __m128i y_lo = _mm_cvtepu8_epi16(vy);
+    sum = _mm_add_epi32(sum, _mm_madd_epi16(x_lo, y_lo));
+
+    // High 8 bytes: shift down, zero-extend, then multiply-and-add
+    __m128i x_hi = _mm_cvtepu8_epi16(_mm_srli_si128(vx, 8));
+    __m128i y_hi = _mm_cvtepu8_epi16(_mm_srli_si128(vy, 8));
     sum = _mm_add_epi32(sum, _mm_madd_epi16(x_hi, y_hi));
   }
 
