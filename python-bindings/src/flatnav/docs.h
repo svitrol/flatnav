@@ -12,6 +12,8 @@ Args:
     data (np.ndarray): The data to add to the index.
     ef_construction (int): The number of vertices to visit while inserting every vector in the graph.
     num_initializations (int, optional): The number of initializations to perform. Defaults to 100.
+    patience (int, optional): Number of consecutive iterations without significant improvement before early termination. 0 disables it. Defaults to 0.
+    patience_threshold (float, optional): Saturation threshold (0-100) for candidate quality. Defaults to 95.0.
     labels (Optional[np.ndarray], optional): The labels for the data. Defaults to None.
 Returns:
     None
@@ -38,8 +40,10 @@ Args:
     K (int): The number of neighbors to return.
     ef_search (int): The number of neighbors to visit while finding the closest neighbors for the query.
     num_initializations (int, optional): The number of initializations to perform. Defaults to 100.
+    patience (int, optional): Number of consecutive iterations without significant improvement before early termination. 0 disables it. Defaults to 0.
+    patience_threshold (float, optional): Saturation threshold (0-100) for candidate quality. Defaults to 95.0.
 Returns:
-    Tuple[np.ndarray, np.ndarray]: The distances and label ID's of the closest neighbors.
+    Tuple[np.ndarray, np.ndarray, int]: The distances, label ID's, and the number of distance computations performed.
 )pbdoc";
 
 static const char *SEARCH_DOCSTRING = R"pbdoc(
@@ -53,8 +57,10 @@ Args:
     K (int): The number of neighbors to return.
     ef_search (int): The number of neighbors to visit while finding the closest neighbors for every query.
     num_initializations (int, optional): The number of initializations to perform. Defaults to 100.
+    patience (int, optional): Number of consecutive iterations without significant improvement before early termination. 0 disables it. Defaults to 0.
+    patience_threshold (float, optional): Saturation threshold (0-100) for candidate quality. Defaults to 95.0.
 Returns:
-    Tuple[np.ndarray, np.ndarray]: The distances and label ID's of the closest neighbors.
+    Tuple[np.ndarray, np.ndarray, np.ndarray]: The distances, label ID's, and a 1D array of distance computations per query.
 )pbdoc";
 
 static const char *GET_GRAPH_OUTDEGREE_TABLE_DOCSTRING = R"pbdoc(

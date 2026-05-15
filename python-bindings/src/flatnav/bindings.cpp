@@ -61,12 +61,14 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   bool _verbose;
   Index<dist_t, label_t>* _index;
 
-  typedef std::pair<py::array_t<float>, py::array_t<label_t>> DistancesLabelsPair;
+  typedef std::tuple<py::array_t<float>, py::array_t<label_t>, py::array_t<uint32_t>>
+      SearchResultTuple;
 
   // Internal add method that handles templated dispatch
   template <typename data_type>
   void addImpl(const py::array_t<data_type, py::array::c_style | py::array::forcecast>& data,
-               int ef_construction, int num_initializations = 100, py::object labels = py::none()) {
+               int ef_construction, int num_initializations = 100,
+               py::object labels = py::none()) {
     // py::array_t<float, py::array::c_style | py::array::forcecast> means that
     // the functions expects either a Numpy array of floats or a castable type
     // to that type. If the given type can't be casted, pybind11 will throw an
@@ -122,17 +124,17 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   }
 
   template <typename data_type>
-  DistancesLabelsPair searchSingleImpl(
-      const py::array_t<data_type, py::array::c_style | py::array::forcecast>& query, int K, int ef_search,
-      int num_initializations = 100) {
+  SearchResultTuple searchSingleImpl(
+      const py::array_t<data_type, py::array::c_style | py::array::forcecast>& query,
+      int K, int ef_search, int num_initializations = 100) {
     if (query.ndim() != 1 || query.shape(0) != _dim) {
       throw std::invalid_argument("Query has incorrect dimensions.");
     }
 
-    std::vector<std::pair<float, label_t>> top_k = this->_index->search(
-        /* query = */ (const void*)query.data(0), /* K = */ K,
-        /* ef_search = */ ef_search,
-        /* num_initializations = */ num_initializations);
+    auto [top_k, dist_comps] =
+        this->_index->search(/* query = */ (const void*)query.data(0), /* K = */ K,
+                             /* ef_search = */ ef_search,
+                             /* num_initializations = */ num_initializations);
 
     if (top_k.size() != K) {
       throw std::runtime_error("Search did not return the expected number of results. Expected " +
@@ -148,9 +150,11 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     }
 
     // Allows to transfer ownership to Python
-    py::capsule free_labels_when_done(labels, [](void* ptr) { delete (label_t*)ptr; });
+    py::capsule free_labels_when_done(labels,
+                                      [](void* ptr) { delete (label_t*)ptr; });
 
-    py::capsule free_distances_when_done(distances, [](void* ptr) { delete (float*)ptr; });
+    py::capsule free_distances_when_done(distances,
+                                         [](void* ptr) { delete (float*)ptr; });
 
     py::array_t<label_t> labels_array =
         py::array_t<label_t>({K}, {sizeof(label_t)}, labels, free_labels_when_done);
@@ -158,13 +162,14 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> distances_array =
         py::array_t<float>({K}, {sizeof(float)}, distances, free_distances_when_done);
 
-    return {distances_array, labels_array};
+    return std::make_tuple(distances_array, labels_array, py::cast(dist_comps));
   }
 
   template <typename data_type>
-  DistancesLabelsPair searchImpl(
-      const py::array_t<data_type, py::array::c_style | py::array::forcecast>& queries, int K, int ef_search,
-      int num_initializations = 100) {
+  SearchResultTuple searchImpl(
+      const py::array_t<data_type, py::array::c_style | py::array::forcecast>&
+          queries,
+      int K, int ef_search, int num_initializations = 100) {
     size_t num_queries = queries.shape(0);
     size_t queries_dim = queries.shape(1);
 
@@ -175,11 +180,12 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     auto num_threads = _index->getNumThreads();
     label_t* results = new label_t[num_queries * K];
     float* distances = new float[num_queries * K];
+    uint32_t* computations = new uint32_t[num_queries];
 
     // No need to spawn any threads if we are in a single-threaded environment
     if (num_threads == 1) {
       for (size_t query_index = 0; query_index < num_queries; query_index++) {
-        std::vector<std::pair<float, label_t>> top_k = this->_index->search(
+        auto [top_k, dist_comps] = this->_index->search(
             /* query = */ (const void*)queries.data(query_index), /* K = */ K,
             /* ef_search = */ ef_search,
             /* num_initializations = */ num_initializations);
@@ -195,6 +201,7 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
           distances[query_index * K + i] = top_k[i].first;
           results[query_index * K + i] = top_k[i].second;
         }
+        computations[query_index] = dist_comps;
       }
     } else {
       // Parallelize the search
@@ -203,7 +210,7 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
           /* num_threads = */ num_threads,
           /* function = */ [&](uint32_t row_index) {
             auto* query = (const void*)queries.data(row_index);
-            std::vector<std::pair<float, label_t>> top_k = this->_index->search(
+            auto [top_k, dist_comps] = this->_index->search(
                 /* query = */ query, /* K = */ K, /* ef_search = */ ef_search,
                 /* num_initializations = */ num_initializations);
 
@@ -211,12 +218,17 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
               distances[(row_index * K) + result_id] = top_k[result_id].first;
               results[(row_index * K) + result_id] = top_k[result_id].second;
             }
+            computations[row_index] = dist_comps;
           });
     }
 
     // Allows to transfer ownership to Python
-    py::capsule free_results_when_done(results, [](void* ptr) { delete (label_t*)ptr; });
-    py::capsule free_distances_when_done(distances, [](void* ptr) { delete (float*)ptr; });
+    py::capsule free_results_when_done(results,
+                                      [](void* ptr) { delete (label_t*)ptr; });
+    py::capsule free_distances_when_done(distances,
+                                         [](void* ptr) { delete (float*)ptr; });
+    py::capsule free_comps_when_done(computations,
+                                     [](void* ptr) { delete (uint32_t*)ptr; });
 
     py::array_t<label_t> labels = py::array_t<label_t>({num_queries, (size_t)K},  // shape of the array
                                                        {K * sizeof(label_t), sizeof(label_t)},  // strides
@@ -227,7 +239,11 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> dists = py::array_t<float>(
         {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
 
-    return {dists, labels};
+    py::array_t<uint32_t> comps =
+        py::array_t<uint32_t>({num_queries}, {sizeof(uint32_t)}, computations,
+                               free_comps_when_done);
+
+    return std::make_tuple(dists, labels, comps);
   }
 
  public:
@@ -337,22 +353,28 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
         ef_construction, num_initializations, labels);
   }
 
-  DistancesLabelsPair search(const py::array& queries, int K, int ef_search, int num_initializations) {
+  SearchResultTuple search(const py::array& queries, int K, int ef_search,
+                           int num_initializations) {
     auto data_type = _index->getDataType();
     return cast_and_call(
         data_type, queries,
         [this](auto&& casted_queries, int k, int ef, int num_init) {
-          return this->searchImpl(std::forward<decltype(casted_queries)>(casted_queries), k, ef, num_init);
+          return this->searchImpl(
+              std::forward<decltype(casted_queries)>(casted_queries), k, ef,
+              num_init);
         },
         K, ef_search, num_initializations);
   }
 
-  DistancesLabelsPair searchSingle(const py::array& query, int K, int ef_search, int num_initializations) {
+  SearchResultTuple searchSingle(const py::array& query, int K, int ef_search,
+                                 int num_initializations) {
     auto data_type = _index->getDataType();
     return cast_and_call(
         data_type, query,
         [this](auto&& casted_query, int k, int ef, int num_init) {
-          return this->searchSingleImpl(std::forward<decltype(casted_query)>(casted_query), k, ef, num_init);
+          return this->searchSingleImpl(
+              std::forward<decltype(casted_query)>(casted_query), k, ef,
+              num_init);
         },
         K, ef_search, num_initializations);
   }

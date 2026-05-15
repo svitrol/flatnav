@@ -297,7 +297,8 @@ class Index {
    */
   template <typename data_type>
   void addBatch(void* data, std::vector<label_t>& labels, int ef_construction,
-                int num_initializations = 100) {
+                int num_initializations = 100, int patience = 0,
+                float patience_threshold = 95.0f) {
       if (num_initializations <= 0) {
           throw std::invalid_argument("num_initializations must be greater than 0.");
       }
@@ -310,7 +311,8 @@ class Index {
               uint64_t offset = static_cast<uint64_t>(row_index) * static_cast<uint64_t>(data_dimension);
               void* vector = (data_type*)data + offset;
               label_t label = labels[row_index];
-              this->add(vector, label, ef_construction, num_initializations);
+              this->add(vector, label, ef_construction, num_initializations,
+                        patience, patience_threshold);
           }
           return;
       }
@@ -322,7 +324,8 @@ class Index {
               uint64_t offset = static_cast<uint64_t>(row_index) * static_cast<uint64_t>(data_dimension);
               void* vector = (data_type*)data + offset;
               label_t label = labels[row_index];
-              this->add(vector, label, ef_construction, num_initializations);
+              this->add(vector, label, ef_construction, num_initializations,
+                        patience, patience_threshold);
           });
   }
 
@@ -348,7 +351,8 @@ class Index {
    * @exception std::runtime_error Thrown if the maximum number of nodes is
    * reached.
    */
-  void add(void* data, label_t& label, int ef_construction, int num_initializations) {
+  void add(void* data, label_t& label, int ef_construction,
+           int num_initializations, int patience = 0, float patience_threshold = 95.0f) {
 
     if (_cur_num_nodes >= _max_node_count) {
       throw std::runtime_error(
@@ -368,7 +372,9 @@ class Index {
 
     auto neighbors = beamSearch(
         /* query = */ data, /* entry_node = */ entry_node,
-        /* buffer_size = */ ef_construction);
+        /* buffer_size = */ ef_construction,
+        /* patience = */ patience,
+        /* patience_threshold = */ patience_threshold);
 
     int selection_M = std::max(static_cast<int>(_M / 2), 1);
     selectNeighbors(/* neighbors = */ neighbors, /* M = */ selection_M);
@@ -383,11 +389,15 @@ class Index {
    * @param num_initializations The number of random initializations to use.
    */
   std::vector<dist_label_t> search(const void* query, const int K, int ef_search,
-                                   int num_initializations = 100) {
+                                   int num_initializations = 100,
+                                   int patience = 0,
+                                   float patience_threshold = 95.0f) {
     node_id_t entry_node = initializeSearch(query, num_initializations);
     PriorityQueue neighbors = beamSearch(/* query = */ query,
                                          /* entry_node = */ entry_node,
-                                         /* buffer_size = */ std::max(ef_search, K));
+                                         /* buffer_size = */ std::max(ef_search, K),
+                                         /* patience = */ patience,
+                                         /* patience_threshold = */ patience_threshold);
     auto size = neighbors.size();
     std::vector<dist_label_t> results;
     results.reserve(size);
@@ -601,13 +611,15 @@ class Index {
    * @return PriorityQueue
    */
 
-  PriorityQueue beamSearch(const void* query, const node_id_t entry_node, 
-          const int buffer_size) {
+  PriorityQueue beamSearch(const void* query, const node_id_t entry_node,
+                           const int buffer_size, int patience = 0,
+                           float patience_threshold = 95.0f) {
     PriorityQueue neighbors;
     PriorityQueue candidates;
 
     auto* visited_set = _visited_set_pool->pollAvailableSet();
     visited_set->clear();
+    int patience_counter = 0;
 
     // Prefetch the data for entry node before computing its distance.
 #ifdef USE_SSE
@@ -643,11 +655,24 @@ class Index {
       }
 #endif
 
-      processCandidateNode(
+      uint32_t num_inserted = processCandidateNode(
           /* query = */ query, /* node = */ node,
           /* max_dist = */ max_dist, /* buffer_size = */ buffer_size,
           /* visited_set = */ visited_set,
           /* neighbors = */ neighbors, /* candidates = */ candidates);
+
+      if (patience > 0) {
+        // Calculate overlap phi: percent of buffer unchanged.
+        float overlap = 100.0f * (static_cast<float>(buffer_size) - num_inserted) / buffer_size;
+        if (overlap >= patience_threshold) {
+          patience_counter++;
+        } else {
+          patience_counter = 0;
+        }
+        if (patience_counter >= patience) {
+          break;
+        }
+      }
     }
 
     _visited_set_pool->pushVisitedSet(
@@ -656,10 +681,11 @@ class Index {
     return neighbors;
   }
 
-  void processCandidateNode(const void* query, node_id_t& node, float& max_dist, const int buffer_size,
+  uint32_t processCandidateNode(const void* query, node_id_t& node, float& max_dist, const int buffer_size,
                             VisitedSet* visited_set, PriorityQueue& neighbors, PriorityQueue& candidates) {
     // Lock all operations on this specific node
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
+    uint32_t inserted_count = 0;
 
     node_id_t* neighbor_node_links = getNodeLinks(node);
     for (uint32_t i = 0; i < _M; i++) {
@@ -691,6 +717,7 @@ class Index {
       if (neighbors.size() < buffer_size || dist < max_dist) {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
+        inserted_count++;
 #ifdef USE_SSE
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif
@@ -702,6 +729,7 @@ class Index {
         }
       }
     }
+    return inserted_count;
   }
 
   /**
@@ -840,7 +868,7 @@ class Index {
    * @param num_initializations
    * @return node_id_t
    */
-  inline node_id_t initializeSearch(const void* query, int num_initializations) {
+  inline std::pair<node_id_t, uint32_t> initializeSearch(const void* query, int num_initializations) {
     // select entry_node from a set of random entry point options
     if (num_initializations <= 0) {
       throw std::invalid_argument("num_initializations must be greater than 0.");
@@ -851,6 +879,7 @@ class Index {
 
     float min_dist = std::numeric_limits<float>::max();
     node_id_t entry_node = 0;
+    uint32_t comps = 0;
 
     if (_collect_stats) {
       _distance_computations.fetch_add(num_initializations);
@@ -859,12 +888,13 @@ class Index {
     for (node_id_t node = 0; node < _cur_num_nodes; node += step_size) {
       float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(node),
                                        /* asymmetric = */ true);
+      comps++;
       if (dist < min_dist) {
         min_dist = dist;
         entry_node = node;
       }
     }
-    return entry_node;
+    return {entry_node, comps};
   }
 
   void relabel(const std::vector<node_id_t>& P) {
