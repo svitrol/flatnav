@@ -61,8 +61,11 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   bool _verbose;
   Index<dist_t, label_t>* _index;
 
-  typedef std::tuple<py::array_t<float>, py::array_t<label_t>, py::array_t<uint32_t>>
+  // (distances, labels, distance computations per query)
+  typedef std::tuple<py::array_t<float>, py::array_t<label_t>, py::array_t<uint64_t>>
       SearchResultTuple;
+  typedef std::tuple<py::array_t<float>, py::array_t<label_t>, uint64_t>
+      SearchSingleResultTuple;
 
   // Internal add method that handles templated dispatch
   template <typename data_type>
@@ -124,17 +127,20 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   }
 
   template <typename data_type>
-  SearchResultTuple searchSingleImpl(
+  SearchSingleResultTuple searchSingleImpl(
       const py::array_t<data_type, py::array::c_style | py::array::forcecast>& query,
-      int K, int ef_search, int num_initializations = 100) {
+      int K, int ef_search, int num_initializations = 100, int patience = 0,
+      float patience_threshold = 95.0f) {
     if (query.ndim() != 1 || query.shape(0) != _dim) {
       throw std::invalid_argument("Query has incorrect dimensions.");
     }
 
     auto [top_k, dist_comps] =
-        this->_index->search(/* query = */ (const void*)query.data(0), /* K = */ K,
-                             /* ef_search = */ ef_search,
-                             /* num_initializations = */ num_initializations);
+        this->_index->searchWithMetrics(/* query = */ (const void*)query.data(0), /* K = */ K,
+                                        /* ef_search = */ ef_search,
+                                        /* num_initializations = */ num_initializations,
+                                        /* patience = */ patience,
+                                        /* patience_threshold = */ patience_threshold);
 
     if (top_k.size() != K) {
       throw std::runtime_error("Search did not return the expected number of results. Expected " +
@@ -162,14 +168,15 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> distances_array =
         py::array_t<float>({K}, {sizeof(float)}, distances, free_distances_when_done);
 
-    return std::make_tuple(distances_array, labels_array, py::cast(dist_comps));
+    return std::make_tuple(distances_array, labels_array, dist_comps);
   }
 
   template <typename data_type>
   SearchResultTuple searchImpl(
       const py::array_t<data_type, py::array::c_style | py::array::forcecast>&
           queries,
-      int K, int ef_search, int num_initializations = 100) {
+      int K, int ef_search, int num_initializations = 100, int patience = 0,
+      float patience_threshold = 95.0f) {
     size_t num_queries = queries.shape(0);
     size_t queries_dim = queries.shape(1);
 
@@ -180,15 +187,17 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     auto num_threads = _index->getNumThreads();
     label_t* results = new label_t[num_queries * K];
     float* distances = new float[num_queries * K];
-    uint32_t* computations = new uint32_t[num_queries];
+    uint64_t* computations = new uint64_t[num_queries];
 
     // No need to spawn any threads if we are in a single-threaded environment
     if (num_threads == 1) {
       for (size_t query_index = 0; query_index < num_queries; query_index++) {
-        auto [top_k, dist_comps] = this->_index->search(
+        auto [top_k, dist_comps] = this->_index->searchWithMetrics(
             /* query = */ (const void*)queries.data(query_index), /* K = */ K,
             /* ef_search = */ ef_search,
-            /* num_initializations = */ num_initializations);
+            /* num_initializations = */ num_initializations,
+            /* patience = */ patience,
+            /* patience_threshold = */ patience_threshold);
 
         if (top_k.size() != K) {
           throw std::runtime_error(
@@ -210,9 +219,11 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
           /* num_threads = */ num_threads,
           /* function = */ [&](uint32_t row_index) {
             auto* query = (const void*)queries.data(row_index);
-            auto [top_k, dist_comps] = this->_index->search(
+            auto [top_k, dist_comps] = this->_index->searchWithMetrics(
                 /* query = */ query, /* K = */ K, /* ef_search = */ ef_search,
-                /* num_initializations = */ num_initializations);
+                /* num_initializations = */ num_initializations,
+                /* patience = */ patience,
+                /* patience_threshold = */ patience_threshold);
 
             for (uint32_t result_id = 0; result_id < K; result_id++) {
               distances[(row_index * K) + result_id] = top_k[result_id].first;
@@ -228,7 +239,7 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::capsule free_distances_when_done(distances,
                                          [](void* ptr) { delete (float*)ptr; });
     py::capsule free_comps_when_done(computations,
-                                     [](void* ptr) { delete (uint32_t*)ptr; });
+                                     [](void* ptr) { delete[] (uint64_t*)ptr; });
 
     py::array_t<label_t> labels = py::array_t<label_t>({num_queries, (size_t)K},  // shape of the array
                                                        {K * sizeof(label_t), sizeof(label_t)},  // strides
@@ -239,8 +250,8 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
     py::array_t<float> dists = py::array_t<float>(
         {num_queries, (size_t)K}, {K * sizeof(float), sizeof(float)}, distances, free_distances_when_done);
 
-    py::array_t<uint32_t> comps =
-        py::array_t<uint32_t>({num_queries}, {sizeof(uint32_t)}, computations,
+    py::array_t<uint64_t> comps =
+        py::array_t<uint64_t>({num_queries}, {sizeof(uint64_t)}, computations,
                                free_comps_when_done);
 
     return std::make_tuple(dists, labels, comps);
@@ -354,29 +365,31 @@ class PyIndex : public std::enable_shared_from_this<PyIndex<dist_t, label_t>> {
   }
 
   SearchResultTuple search(const py::array& queries, int K, int ef_search,
-                           int num_initializations) {
+                           int num_initializations, int patience = 0,
+                           float patience_threshold = 95.0f) {
     auto data_type = _index->getDataType();
     return cast_and_call(
         data_type, queries,
-        [this](auto&& casted_queries, int k, int ef, int num_init) {
+        [this](auto&& casted_queries, int k, int ef, int num_init, int pat, float pat_threshold) {
           return this->searchImpl(
               std::forward<decltype(casted_queries)>(casted_queries), k, ef,
-              num_init);
+              num_init, pat, pat_threshold);
         },
-        K, ef_search, num_initializations);
+        K, ef_search, num_initializations, patience, patience_threshold);
   }
 
-  SearchResultTuple searchSingle(const py::array& query, int K, int ef_search,
-                                 int num_initializations) {
+  SearchSingleResultTuple searchSingle(const py::array& query, int K, int ef_search,
+                                       int num_initializations, int patience = 0,
+                                       float patience_threshold = 95.0f) {
     auto data_type = _index->getDataType();
     return cast_and_call(
         data_type, query,
-        [this](auto&& casted_query, int k, int ef, int num_init) {
+        [this](auto&& casted_query, int k, int ef, int num_init, int pat, float pat_threshold) {
           return this->searchSingleImpl(
               std::forward<decltype(casted_query)>(casted_query), k, ef,
-              num_init);
+              num_init, pat, pat_threshold);
         },
-        K, ef_search, num_initializations);
+        K, ef_search, num_initializations, patience, patience_threshold);
   }
 };
 
@@ -483,18 +496,23 @@ void bindSpecialization(py::module_& index_submodule) {
           py::arg("data"), ALLOCATE_NODES_DOCSTRING)
       .def(
           "search_single",
-          [](IndexType& index, const py::array& query, int K, int ef_search, int num_initializations = 100) {
-            return index.searchSingle(query, K, ef_search, num_initializations);
+          [](IndexType& index, const py::array& query, int K, int ef_search, int num_initializations = 100,
+             int patience = 0, float patience_threshold = 95.0f) {
+            return index.searchSingle(query, K, ef_search, num_initializations, patience,
+                                      patience_threshold);
           },
           py::arg("query"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
+          py::arg("patience") = 0, py::arg("patience_threshold") = 95.0f,
           SEARCH_SINGLE_DOCSTRING)
       .def(
           "search",
           [](IndexType& index, const py::array& queries, int K, int ef_search,
-             int num_initializations = 100) {
-            return index.search(queries, K, ef_search, num_initializations);
+             int num_initializations = 100, int patience = 0, float patience_threshold = 95.0f) {
+            return index.search(queries, K, ef_search, num_initializations, patience,
+                                patience_threshold);
           },
           py::arg("queries"), py::arg("K"), py::arg("ef_search"), py::arg("num_initializations") = 100,
+          py::arg("patience") = 0, py::arg("patience_threshold") = 95.0f,
           SEARCH_DOCSTRING)
       .def("get_query_distance_computations", &IndexType::getQueryDistanceComputations,
            GET_QUERY_DISTANCE_COMPUTATIONS_DOCSTRING)

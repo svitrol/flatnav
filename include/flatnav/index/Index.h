@@ -361,7 +361,7 @@ class Index {
           "create a larger index.");
     }
     std::unique_lock<std::mutex> global_lock(_index_data_guard);
-    auto entry_node = initializeSearch(data, num_initializations);
+    node_id_t entry_node = initializeSearch(data, num_initializations).first;
     node_id_t new_node_id;
     allocateNode(data, label, new_node_id);
     global_lock.unlock();
@@ -373,6 +373,7 @@ class Index {
     auto neighbors = beamSearch(
         /* query = */ data, /* entry_node = */ entry_node,
         /* buffer_size = */ ef_construction,
+        /* K = */ std::max(static_cast<int>(_M / 2), 1),
         /* patience = */ patience,
         /* patience_threshold = */ patience_threshold);
 
@@ -392,12 +393,27 @@ class Index {
                                    int num_initializations = 100,
                                    int patience = 0,
                                    float patience_threshold = 95.0f) {
-    node_id_t entry_node = initializeSearch(query, num_initializations);
+    return searchWithMetrics(query, K, ef_search, num_initializations, patience,
+                             patience_threshold).first;
+  }
+
+  /***
+   * @brief Same as search(), additionally returns the number of distance
+   * computations done by this query (initialization included). The count is
+   * local to the query, so it is correct also for multi-threaded batch search.
+   */
+  std::pair<std::vector<dist_label_t>, uint64_t> searchWithMetrics(
+      const void* query, const int K, int ef_search, int num_initializations = 100,
+      int patience = 0, float patience_threshold = 95.0f) {
+    auto [entry_node, init_comps] = initializeSearch(query, num_initializations);
+    uint64_t dist_comps = init_comps;
     PriorityQueue neighbors = beamSearch(/* query = */ query,
                                          /* entry_node = */ entry_node,
                                          /* buffer_size = */ std::max(ef_search, K),
+                                         /* K = */ K,
                                          /* patience = */ patience,
-                                         /* patience_threshold = */ patience_threshold);
+                                         /* patience_threshold = */ patience_threshold,
+                                         /* dist_comps = */ &dist_comps);
     auto size = neighbors.size();
     std::vector<dist_label_t> results;
     results.reserve(size);
@@ -413,7 +429,7 @@ class Index {
       results.resize(K);
     }
 
-    return results;
+    return {results, dist_comps};
   }
 
 
@@ -612,13 +628,21 @@ class Index {
    */
 
   PriorityQueue beamSearch(const void* query, const node_id_t entry_node,
-                           const int buffer_size, int patience = 0,
-                           float patience_threshold = 95.0f) {
+                           const int buffer_size, int K = 0, int patience = 0,
+                           float patience_threshold = 95.0f,
+                           uint64_t* dist_comps = nullptr) {
     PriorityQueue neighbors;
     PriorityQueue candidates;
 
     auto* visited_set = _visited_set_pool->pollAvailableSet();
     visited_set->clear();
+
+    // Early termination from "Patience in Proximity" (Teofili & Lin): after
+    // every hop the saturation is the percentage of the current top-K that did
+    // not change during the hop. When saturation >= patience_threshold for
+    // `patience` consecutive hops, search stops.
+    size_t patience_k = K > 0 ? static_cast<size_t>(K) : 1;
+    std::priority_queue<float> patience_top_k;  // max-heap of the K best distances
     int patience_counter = 0;
 
     // Prefetch the data for entry node before computing its distance.
@@ -628,6 +652,12 @@ class Index {
 
     float dist = _distance->distance(/* x = */ query, /* y = */ getNodeData(entry_node),
                                      /* asymmetric = */ true);
+    if (dist_comps) {
+      (*dist_comps)++;
+    }
+    if (patience > 0) {
+      patience_top_k.push(dist);
+    }
 
     float max_dist = dist;
     candidates.emplace(-dist, entry_node);
@@ -655,16 +685,22 @@ class Index {
       }
 #endif
 
-      uint32_t num_inserted = processCandidateNode(
+      uint32_t top_k_changes = processCandidateNode(
           /* query = */ query, /* node = */ node,
           /* max_dist = */ max_dist, /* buffer_size = */ buffer_size,
           /* visited_set = */ visited_set,
-          /* neighbors = */ neighbors, /* candidates = */ candidates);
+          /* neighbors = */ neighbors, /* candidates = */ candidates,
+          /* patience_top_k = */ patience > 0 ? &patience_top_k : nullptr,
+          /* patience_k = */ patience_k,
+          /* dist_comps = */ dist_comps);
 
-      if (patience > 0) {
-        // Calculate overlap phi: percent of buffer unchanged.
-        float overlap = 100.0f * (static_cast<float>(buffer_size) - num_inserted) / buffer_size;
-        if (overlap >= patience_threshold) {
+      // Saturation is only counted once the top-K is full.
+      if (patience > 0 && patience_top_k.size() < patience_k) {
+        patience_counter = 0;
+      } else if (patience > 0) {
+        size_t changed = std::min(static_cast<size_t>(top_k_changes), patience_k);
+        float saturation = 100.0f * static_cast<float>(patience_k - changed) / patience_k;
+        if (saturation >= patience_threshold) {
           patience_counter++;
         } else {
           patience_counter = 0;
@@ -681,11 +717,15 @@ class Index {
     return neighbors;
   }
 
+  // Returns how many times the top-K tracked in `patience_top_k` changed
+  // (0 when patience_top_k is nullptr).
   uint32_t processCandidateNode(const void* query, node_id_t& node, float& max_dist, const int buffer_size,
-                            VisitedSet* visited_set, PriorityQueue& neighbors, PriorityQueue& candidates) {
+                                VisitedSet* visited_set, PriorityQueue& neighbors, PriorityQueue& candidates,
+                                std::priority_queue<float>* patience_top_k = nullptr,
+                                size_t patience_k = 1, uint64_t* dist_comps = nullptr) {
     // Lock all operations on this specific node
     std::unique_lock<std::mutex> lock(_node_links_mutexes[node]);
-    uint32_t inserted_count = 0;
+    uint32_t top_k_changes = 0;
 
     node_id_t* neighbor_node_links = getNodeLinks(node);
     for (uint32_t i = 0; i < _M; i++) {
@@ -713,11 +753,23 @@ class Index {
       if (_collect_stats) {
         _distance_computations.fetch_add(1);
       }
+      if (dist_comps) {
+        (*dist_comps)++;
+      }
+      if (patience_top_k) {
+        if (patience_top_k->size() < patience_k) {
+          patience_top_k->push(dist);
+          top_k_changes++;
+        } else if (dist < patience_top_k->top()) {
+          patience_top_k->pop();
+          patience_top_k->push(dist);
+          top_k_changes++;
+        }
+      }
 
       if (neighbors.size() < buffer_size || dist < max_dist) {
         candidates.emplace(-dist, neighbor_node_id);
         neighbors.emplace(dist, neighbor_node_id);
-        inserted_count++;
 #ifdef USE_SSE
         _mm_prefetch(getNodeData(candidates.top().second), _MM_HINT_T0);
 #endif
@@ -729,7 +781,7 @@ class Index {
         }
       }
     }
-    return inserted_count;
+    return top_k_changes;
   }
 
   /**
